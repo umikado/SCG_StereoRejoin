@@ -705,3 +705,137 @@ def test_delete_sources_skips_a_source_rewritten_after_it_was_read(tmp_path: Pat
     assert left.name in warning
     info = read_wav(report.joined[0].output)
     assert read_audio(report.joined[0].output, info) == reference_interleave(audio, audio, 2)
+
+
+def _atomic_wav(path: Path, audio: bytes, *, rate: int = 48_000) -> None:
+    staged = Path(str(path) + ".reexport")
+    write_mono(staged, audio, encoding="pcm16", rate=rate)
+    os.replace(staged, path)
+
+
+def _find_mono(root: Path, audio: bytes):
+    found = []
+    for candidate in root.rglob("*"):
+        if not candidate.is_file():
+            continue
+        try:
+            info = read_wav(candidate)
+        except Exception:
+            continue
+        if info.fmt.channels != 1:
+            continue
+        try:
+            payload = read_audio(candidate, info)
+        except Exception:
+            continue
+        if payload == audio:
+            found.append(candidate)
+    return found
+
+
+def test_header_and_audio_stay_on_one_file_when_source_is_reexported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A re-export between the header parse and the audio read must not be consumed."""
+    from scg_stereorejoin import rejoin as rejoin_mod
+    from scg_stereorejoin import wav as wav_mod
+
+    short = pattern_bytes(2, 4, 1)
+    longer = pattern_bytes(2, 8, 9)
+    left = tmp_path / "A.L.wav"
+    right = tmp_path / "A.R.wav"
+    write_mono(left, short, encoding="pcm16", rate=48_000)
+    write_mono(right, short, encoding="pcm16", rate=48_000)
+    real_handle = wav_mod.read_wav_handle
+
+    def parse_then_reexport(path, handle, file_size):
+        info = real_handle(path, handle, file_size)
+        if Path(path) == left:
+            _atomic_wav(left, longer, rate=44_100)
+        return info
+
+    monkeypatch.setattr(wav_mod, "read_wav_handle", parse_then_reexport)
+    monkeypatch.setattr(rejoin_mod, "read_wav_handle", parse_then_reexport)
+    report = join_folder(tmp_path, tmp_path / "out", delete_sources=True)
+    survivors = _find_mono(tmp_path, longer)
+    assert survivors, "the 8-frame re-export was destroyed"
+    kept = read_wav(survivors[0])
+    assert kept.frames == 8
+    assert kept.fmt.sample_rate == 44_100
+    assert report.joined
+    info = read_wav(report.joined[0].output)
+    assert info.frames == 4
+    assert info.fmt.sample_rate == 48_000
+    assert read_audio(report.joined[0].output, info) == reference_interleave(short, short, 2)
+    warning = " ".join(report.joined[0].warnings)
+    assert "changed" in warning
+
+
+def test_reexport_between_source_check_and_unlink_is_kept(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Replacing the path after the old inode was checked must not destroy the new file."""
+    from scg_stereorejoin import rejoin as rejoin_mod
+
+    original = pattern_bytes(2, 4, 3)
+    fresh = pattern_bytes(2, 4, 11)
+    left = tmp_path / "A.L.wav"
+    right = tmp_path / "A.R.wav"
+    write_mono(left, original, encoding="pcm16")
+    write_mono(right, original, encoding="pcm16")
+    real_unlink = Path.unlink
+    real_replace = os.replace
+    real_rename = os.rename
+    planted = {"done": False}
+
+    def plant() -> None:
+        if planted["done"]:
+            return
+        planted["done"] = True
+        staged = Path(str(left) + ".fresh")
+        write_mono(staged, fresh, encoding="pcm16")
+        real_replace(staged, left)
+
+    def unlink(self, *args, **kwargs):
+        if Path(self) == left:
+            plant()
+        return real_unlink(self, *args, **kwargs)
+
+    def replace(src, dst, *args, **kwargs):
+        if Path(src) == left:
+            plant()
+        return real_replace(src, dst, *args, **kwargs)
+
+    def rename(src, dst, *args, **kwargs):
+        if Path(src) == left:
+            plant()
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    monkeypatch.setattr(rejoin_mod.os, "replace", replace)
+    monkeypatch.setattr(rejoin_mod.os, "rename", rename)
+    report = join_folder(tmp_path, tmp_path / "out", delete_sources=True)
+    assert _find_mono(tmp_path, fresh), "the re-exported source was destroyed"
+    assert report.joined
+    info = read_wav(report.joined[0].output)
+    assert read_audio(report.joined[0].output, info) == reference_interleave(original, original, 2)
+
+
+def test_sources_stay_when_output_is_replaced_after_verify(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """--overwrite from a second run must not let the first run delete its sources."""
+    from scg_stereorejoin import rejoin as rejoin_mod
+
+    audio = pattern_bytes(2, 4, 5)
+    write_mono(tmp_path / "A.L.wav", audio, encoding="pcm16")
+    write_mono(tmp_path / "A.R.wav", audio, encoding="pcm16")
+    real_verify = rejoin_mod._verify_published
+
+    def verify_then_replace(path, **kwargs):
+        real_verify(path, **kwargs)
+        staged = Path(str(path) + ".other")
+        staged.write_bytes(b"someone else published this output")
+        os.replace(staged, path)
+
+    monkeypatch.setattr(rejoin_mod, "_verify_published", verify_then_replace)
+    report = join_folder(tmp_path, tmp_path / "out", delete_sources=True)
+    assert (tmp_path / "A.L.wav").is_file()
+    assert (tmp_path / "A.R.wav").is_file()
+    assert report.joined
+    warning = " ".join(report.joined[0].warnings)
+    assert "output" in warning.lower()

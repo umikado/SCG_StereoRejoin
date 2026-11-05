@@ -78,7 +78,10 @@ def build_parser():
     parser.add_argument(
         "--delete-sources",
         action="store_true",
-        help="delete the two mono files after the stereo file verifies, if those sources are unchanged",
+        help=(
+            "move the two mono files into .scg_stereorejoin_trash after the stereo file "
+            "verifies, and only if they are still the version that was read"
+        ),
     )
     parser.add_argument(
         "--bw64",

@@ -181,7 +181,7 @@ class StereoRejoinApp(ttk.Frame):
             ("Include subfolders", self.recursive_var),
             ("Pad a shorter side with silence", self.pad_var),
             ("Overwrite existing outputs", self.overwrite_var),
-            ("Delete source files after a successful join", self.delete_var),
+            ("Move source files to trash after a successful join", self.delete_var),
             ("Use BW64 for files over 4 GB", self.bw64_var),
             ("Dry run", self.dry_var),
         ):

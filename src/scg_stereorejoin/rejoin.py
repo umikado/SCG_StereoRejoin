@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,12 +31,12 @@ from scg_stereorejoin.wav import (
     container_for,
     container_label,
     hash_region,
-    read_wav,
     read_wav_handle,
     write_interleaved_wav,
 )
 
 WAV_SUFFIXES = {".wav", ".wave"}
+_RUN_ID = uuid.uuid4().hex
 _SKIP_WHEN_COPYING = {
     b"fmt ",
     b"data",
@@ -296,10 +297,59 @@ def rejoin_pair(
     if pair.left.resolve() == pair.right.resolve():
         raise PairRefused("left and right paths are the same file")
     try:
-        left = read_wav(pair.left)
-        right = read_wav(pair.right)
-    except WavError as exc:
-        raise PairRefused(str(exc)) from exc
+        left_fh = pair.left.open("rb")
+    except OSError as exc:
+        raise PairRefused(f"{pair.left}: {exc.strerror}") from exc
+    try:
+        try:
+            right_fh = pair.right.open("rb")
+        except OSError as exc:
+            raise PairRefused(f"{pair.right}: {exc.strerror}") from exc
+        try:
+            try:
+                left_stat = os.fstat(left_fh.fileno())
+                left = read_wav_handle(pair.left, left_fh, left_stat.st_size)
+                right_stat = os.fstat(right_fh.fileno())
+                right = read_wav_handle(pair.right, right_fh, right_stat.st_size)
+            except WavError as exc:
+                raise PairRefused(str(exc)) from exc
+            except OSError as exc:
+                raise PairRefused(str(exc)) from exc
+            return _rejoin_parsed(
+                pair,
+                dest,
+                left,
+                right,
+                left_fh,
+                right_fh,
+                pad=pad,
+                overwrite=overwrite,
+                delete_sources=delete_sources,
+                dry_run=dry_run,
+                large_container=large_container,
+                chunk_frames=chunk_frames,
+            )
+        finally:
+            right_fh.close()
+    finally:
+        left_fh.close()
+
+
+def _rejoin_parsed(
+    pair: Pair,
+    dest: Path,
+    left: WavInfo,
+    right: WavInfo,
+    left_fh,
+    right_fh,
+    *,
+    pad: bool,
+    overwrite: bool,
+    delete_sources: bool,
+    dry_run: bool,
+    large_container: bytes,
+    chunk_frames: int,
+) -> JoinedItem:
     reason = incompatibility(left.fmt, right.fmt)
     if reason:
         raise PairRefused(reason)
@@ -352,6 +402,7 @@ def rejoin_pair(
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     temporary = _exclusive_temp(dest)
+    lock_fd: int | None = None
     try:
         written = write_interleaved_wav(
             temporary,
@@ -366,49 +417,55 @@ def rejoin_pair(
             pad=pad or left.frames != right.frames,
             large_container=large_container,
             chunk_frames=chunk_frames,
+            left_handle=left_fh,
+            right_handle=right_fh,
         )
         identity = _file_identity(temporary)
+        lock_fd = _acquire_output_lock(dest)
         _publish(temporary, dest, overwrite=overwrite)
+        if temporary.exists():
+            temporary.unlink()
+        try:
+            _verify_published(
+                dest,
+                identity=identity,
+                frames=written.frames,
+                sample_rate=left.fmt.sample_rate,
+                bits_per_sample=left.fmt.bits_per_sample,
+                audio_sha256=written.audio_sha256,
+            )
+        except (WavError, OSError) as exc:
+            raise PairRefused(f"output failed verification: {dest}: {exc}") from exc
+
+        post_errors: list[str] = []
+        if delete_sources:
+            if _output_still_ours(dest, identity):
+                for source, view in ((pair.left, written.left), (pair.right, written.right)):
+                    _retire_source(source, view, warnings)
+            else:
+                warnings.append(
+                    f"skipped deleting sources: output {dest} no longer names the file this run published"
+                )
+        item = _item(
+            pair,
+            dest,
+            left,
+            frames=written.frames,
+            time_reference=time_reference,
+            padded_left=padded_left,
+            padded_right=padded_right,
+            warnings=warnings,
+            chunks=chunk_names,
+            container=container_label(written.container),
+            wrote=True,
+        )
+        item.post_errors = post_errors
+        return item
     finally:
         if temporary.exists():
             temporary.unlink()
-    try:
-        _verify_published(
-            dest,
-            identity=identity,
-            frames=written.frames,
-            sample_rate=left.fmt.sample_rate,
-            bits_per_sample=left.fmt.bits_per_sample,
-            audio_sha256=written.audio_sha256,
-        )
-    except (WavError, OSError) as exc:
-        raise PairRefused(f"output failed verification: {dest}: {exc}") from exc
-
-    post_errors: list[str] = []
-    if delete_sources:
-        for source, view in ((pair.left, written.left), (pair.right, written.right)):
-            if not _source_unchanged(source, view):
-                warnings.append(f"skipped deleting {source}: file changed after it was read")
-                continue
-            try:
-                source.unlink()
-            except OSError as exc:
-                post_errors.append(f"could not delete {source}: {exc.strerror}")
-    item = _item(
-        pair,
-        dest,
-        left,
-        frames=written.frames,
-        time_reference=time_reference,
-        padded_left=padded_left,
-        padded_right=padded_right,
-        warnings=warnings,
-        chunks=chunk_names,
-        container=container_label(written.container),
-        wrote=True,
-    )
-    item.post_errors = post_errors
-    return item
+        if lock_fd is not None:
+            _release_output_lock(lock_fd)
 
 
 def format_report(report: BatchReport, *, verbose: bool = False, quiet: bool = False) -> str:
@@ -596,6 +653,108 @@ def _exclusive_temp(dest: Path) -> Path:
     raise PairRefused(f"could not create a temporary file in {parent}")
 
 
+def _acquire_output_lock(dest: Path) -> int:
+    """Block other runs that publish or retire sources for this output path."""
+    lock_path = dest.parent / f".{dest.name}.scg-lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+                os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _release_output_lock(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _output_still_ours(dest: Path, identity: tuple[int, int]) -> bool:
+    try:
+        st = dest.stat()
+    except OSError:
+        return False
+    return (st.st_dev, st.st_ino) == identity
+
+
+def _retire_source(source: Path, view: SourceView | None, warnings: list[str]) -> None:
+    """Move ``source`` aside, then keep it only if it is still the file we read.
+
+    The original path is never unlinked. A mismatch is linked back when the
+    path is free, and otherwise left in the trash directory.
+    """
+    if view is None:
+        warnings.append(f"skipped deleting {source}: file changed after it was read")
+        return
+    trash_dir = source.parent / ".scg_stereorejoin_trash" / _RUN_ID
+    try:
+        trash_dir.mkdir(parents=True, exist_ok=True)
+        trash = trash_dir / f"{source.name}.{os.urandom(4).hex()}"
+        os.rename(source, trash)
+    except OSError as exc:
+        warnings.append(f"skipped deleting {source}: {exc.strerror}")
+        return
+    if _quarantine_matches(trash, view):
+        warnings.append(f"moved {source.name} to {trash}")
+        return
+    try:
+        os.link(trash, source)
+    except FileExistsError:
+        warnings.append(f"skipped deleting {source}: quarantined changed file at {trash}")
+        return
+    except OSError as exc:
+        warnings.append(f"skipped deleting {source}: left changed file at {trash} ({exc.strerror})")
+        return
+    warnings.append(f"skipped deleting {source}: file changed after it was read")
+
+
+def _quarantine_matches(path: Path, view: SourceView) -> bool:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != (
+            view.dev,
+            view.ino,
+            view.size,
+            view.mtime_ns,
+        ):
+            return False
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            digest = hash_region(handle, view.offset, view.audio_bytes)
+        return digest == view.audio_sha256
+    except (OSError, WavError):
+        return False
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _file_identity(path: Path) -> tuple[int, int]:
     st = path.stat()
     return (st.st_dev, st.st_ino)
@@ -656,28 +815,6 @@ def _verify_published(
     finally:
         if fd >= 0:
             os.close(fd)
-
-
-def _source_unchanged(path: Path, view: SourceView | None) -> bool:
-    if view is None:
-        return False
-    try:
-        st = path.stat()
-    except OSError:
-        return False
-    if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != (
-        view.dev,
-        view.ino,
-        view.size,
-        view.mtime_ns,
-    ):
-        return False
-    try:
-        with path.open("rb") as handle:
-            digest = hash_region(handle, view.offset, view.audio_bytes)
-    except (OSError, WavError):
-        return False
-    return digest == view.audio_sha256
 
 
 def _collision_key(path: Path) -> str:

@@ -577,6 +577,8 @@ def write_interleaved_wav(
     large_container: bytes = RF64,
     force_container: bytes | None = None,
     chunk_frames: int = 65536,
+    left_handle=None,
+    right_handle=None,
 ) -> WriteResult:
     """Stream two mono files into one interleaved stereo data chunk."""
     if chunk_frames < 1:
@@ -612,6 +614,8 @@ def write_interleaved_wav(
             right_frames=right_frames,
             width=sample_width,
             chunk_frames=chunk_frames,
+            left_handle=left_handle,
+            right_handle=right_handle,
         )
         if data_size & 1:
             handle.write(b"\x00")
@@ -686,6 +690,8 @@ def _stream_interleave(
     right_frames: int,
     width: int,
     chunk_frames: int,
+    left_handle=None,
+    right_handle=None,
 ) -> tuple[str, SourceView, SourceView]:
     frames = max(left_frames, right_frames)
     produced = 0
@@ -694,7 +700,13 @@ def _stream_interleave(
     audio_hash = hashlib.sha256()
     left_hash = hashlib.sha256()
     right_hash = hashlib.sha256()
-    with left_path.open("rb") as left_handle, right_path.open("rb") as right_handle:
+    own_left = left_handle is None
+    own_right = right_handle is None
+    if own_left:
+        left_handle = left_path.open("rb")
+    if own_right:
+        right_handle = right_path.open("rb")
+    try:
         left_stat = os.fstat(left_handle.fileno())
         right_stat = os.fstat(right_handle.fileno())
         left_handle.seek(left_offset)
@@ -717,6 +729,11 @@ def _stream_interleave(
             left_left -= take_left
             right_left -= take_right
             produced += count
+    finally:
+        if own_left:
+            left_handle.close()
+        if own_right:
+            right_handle.close()
     return (
         audio_hash.hexdigest(),
         _source_view(left_stat, left_offset, left_frames * width, left_hash.hexdigest()),
