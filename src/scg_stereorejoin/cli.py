@@ -73,12 +73,12 @@ def build_parser():
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="replace an output file that already exists",
+        help="replace an output file that already exists (never an input in this batch)",
     )
     parser.add_argument(
         "--delete-sources",
         action="store_true",
-        help="delete the two mono files after a successful join",
+        help="delete the two mono files after the stereo file is written and verified",
     )
     parser.add_argument(
         "--bw64",

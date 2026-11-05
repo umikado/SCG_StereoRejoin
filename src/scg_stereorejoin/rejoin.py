@@ -219,7 +219,9 @@ def process(
     for group in pairing.ambiguous:
         report.refused.append(_refuse_group(group))
 
+    input_keys = {_collision_key(path): path for path in files}
     planned: dict[str, Pair] = {}
+    jobs: list[tuple[Pair, Path]] = []
     for pair in pairing.pairs:
         dest = destination_for(pair, output_dir, roots)
         key = _collision_key(dest)
@@ -233,7 +235,19 @@ def process(
                 )
             )
             continue
+        if key in input_keys:
+            report.refused.append(
+                RefusedItem(
+                    pair.left,
+                    pair.right,
+                    f"output path {dest} collides with input {input_keys[key]}",
+                )
+            )
+            continue
         planned[key] = pair
+        jobs.append((pair, dest))
+
+    for pair, dest in jobs:
         if on_message:
             on_message(f"joining {pair.left.name} + {pair.right.name}")
         try:
@@ -334,7 +348,7 @@ def rejoin_pair(
         )
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    temporary = dest.with_name(dest.name + ".partial")
+    temporary = _exclusive_temp(dest)
     try:
         written = write_interleaved_wav(
             temporary,
@@ -354,6 +368,15 @@ def rejoin_pair(
     finally:
         if temporary.exists():
             temporary.unlink()
+    try:
+        _verify_published(
+            dest,
+            frames=written.frames,
+            sample_rate=left.fmt.sample_rate,
+            bits_per_sample=left.fmt.bits_per_sample,
+        )
+    except (WavError, OSError) as exc:
+        raise PairRefused(f"output failed verification: {dest}: {exc}") from exc
 
     post_errors: list[str] = []
     if delete_sources:
@@ -543,6 +566,41 @@ def _refuse_group(group: AmbiguousGroup) -> RefusedItem:
     left = group.paths[0] if group.paths else None
     right = group.paths[1] if len(group.paths) > 1 else None
     return RefusedItem(left, right, group.reason)
+
+
+def _exclusive_temp(dest: Path) -> Path:
+    """Create a unique temporary file in the destination directory.
+
+    ``O_EXCL`` means a concurrent join cannot open the same path, and a
+    pre-existing ``*.partial`` file is never reused.
+    """
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    parent = dest.parent
+    for _ in range(128):
+        candidate = parent / f".{dest.name}.{os.urandom(8).hex()}.partial"
+        try:
+            fd = os.open(candidate, flags, 0o666)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return candidate
+    raise PairRefused(f"could not create a temporary file in {parent}")
+
+
+def _verify_published(path: Path, *, frames: int, sample_rate: int, bits_per_sample: int) -> None:
+    """Re-read a published stereo file before any source is deleted."""
+    info = read_wav(path)
+    problems: list[str] = []
+    if info.fmt.channels != 2:
+        problems.append(f"{info.fmt.channels} channels, expected 2")
+    if info.frames != frames:
+        problems.append(f"{info.frames} frames, expected {frames}")
+    if info.fmt.sample_rate != sample_rate:
+        problems.append(f"{info.fmt.sample_rate} Hz, expected {sample_rate}")
+    if info.fmt.bits_per_sample != bits_per_sample:
+        problems.append(f"{info.fmt.bits_per_sample} bits, expected {bits_per_sample}")
+    if problems:
+        raise WavError(f"{path}: " + "; ".join(problems))
 
 
 def _collision_key(path: Path) -> str:

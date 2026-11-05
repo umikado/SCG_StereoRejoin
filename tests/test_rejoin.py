@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import os
 import struct
+import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
 
 from scg_stereorejoin.chunks import bext_time_reference
-from scg_stereorejoin.pairing import load_patterns
-from scg_stereorejoin.rejoin import process
+from scg_stereorejoin.pairing import Pair, load_patterns
+from scg_stereorejoin.rejoin import process, rejoin_pair
 from scg_stereorejoin.samples import make_samples
-from scg_stereorejoin.wav import read_audio, read_wav
+from scg_stereorejoin.wav import RF64, read_audio, read_wav, write_interleaved_wav
 from tests.support import (
     demo_bext,
     demo_ixml,
@@ -378,3 +380,170 @@ def test_demo_pack_rejoins_bit_exactly(tmp_path: Path):
     fx = read_wav(output / "Fx.wav")
     assert fx.fmt.is_float
     assert struct.unpack("<I", fx.chunk(b"fact").data)[0] == fx.frames
+
+
+def test_overwrite_refuses_output_that_is_another_pairs_source(tmp_path: Path):
+    """Batch --overwrite must not replace a WAV that a later pair still has to read."""
+    kept = pattern_bytes(2, 4, 1)
+    incoming = pattern_bytes(2, 4, 9)
+    write_mono(tmp_path / "X.L.wav", incoming, encoding="pcm16")
+    write_mono(tmp_path / "X.R.wav", incoming, encoding="pcm16")
+    write_mono(tmp_path / "X.wav", kept, encoding="pcm16")
+    write_mono(tmp_path / "Y.wav", kept, encoding="pcm16")
+    original = (tmp_path / "X.wav").read_bytes()
+    report = process(
+        [tmp_path],
+        output_dir=tmp_path,
+        patterns=load_patterns(["X/Y"]),
+        overwrite=True,
+    )
+    assert (tmp_path / "X.wav").read_bytes() == original
+    assert (tmp_path / "Y.wav").read_bytes() == original
+    refused = [item for item in report.refused if item.left and item.left.name == "X.L.wav"]
+    assert refused
+    assert "input" in refused[0].reason
+    stereo = tmp_path / "stereo.wav"
+    assert stereo.is_file()
+    info = read_wav(stereo)
+    assert read_audio(stereo, info) == reference_interleave(kept, kept, 2)
+
+
+def test_overwrite_refuses_output_that_collides_with_any_batch_input(tmp_path: Path):
+    """An output that lands on any input WAV is refused, even if that WAV is unpaired."""
+    audio = pattern_bytes(2, 4, 3)
+    write_mono(tmp_path / "Take.L.wav", audio, encoding="pcm16")
+    write_mono(tmp_path / "Take.R.wav", audio, encoding="pcm16")
+    write_mono(tmp_path / "Take.wav", audio, encoding="pcm16")
+    original = (tmp_path / "Take.wav").read_bytes()
+    report = process(
+        [tmp_path],
+        output_dir=tmp_path,
+        patterns=load_patterns(),
+        overwrite=True,
+    )
+    assert (tmp_path / "Take.wav").read_bytes() == original
+    assert report.joined == []
+    assert report.refused
+    assert "input" in report.refused[0].reason
+
+
+def test_existing_partial_is_left_alone_without_overwrite(tmp_path: Path):
+    """The fixed name Dest.wav.partial must not be reused, with or without --overwrite."""
+    audio = pattern_bytes(2, 4, 5)
+    write_mono(tmp_path / "A.L.wav", audio, encoding="pcm16")
+    write_mono(tmp_path / "A.R.wav", audio, encoding="pcm16")
+    output = tmp_path / "out"
+    output.mkdir()
+    sentinel = output / "A.wav.partial"
+    payload = b"keep-me-untouched-partial"
+    sentinel.write_bytes(payload)
+    report = join_folder(tmp_path, output)
+    assert report.ok
+    assert sentinel.read_bytes() == payload
+    info = read_wav(output / "A.wav")
+    assert read_audio(output / "A.wav", info) == reference_interleave(audio, audio, 2)
+    leftovers = sorted(path.name for path in output.iterdir() if ".partial" in path.name)
+    assert leftovers == ["A.wav.partial"]
+
+
+def test_failed_write_removes_only_its_own_temp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    audio = pattern_bytes(2, 4, 5)
+    write_mono(tmp_path / "A.L.wav", audio, encoding="pcm16")
+    write_mono(tmp_path / "A.R.wav", audio, encoding="pcm16")
+    output = tmp_path / "out"
+    output.mkdir()
+    sentinel = output / "A.wav.partial"
+    sentinel.write_bytes(b"keep-me")
+
+    def boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("scg_stereorejoin.rejoin.write_interleaved_wav", boom)
+    report = join_folder(tmp_path, output)
+    assert not report.ok
+    assert sentinel.read_bytes() == b"keep-me"
+    assert not (output / "A.wav").exists()
+    assert sorted(path.name for path in output.iterdir()) == ["A.wav.partial"]
+
+
+def test_overlapping_writes_do_not_share_a_partial_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Two joins of the same destination must not open one shared *.partial file."""
+    audio = pattern_bytes(2, 8, 6)
+    left = tmp_path / "A.L.wav"
+    right = tmp_path / "A.R.wav"
+    write_mono(left, audio, encoding="pcm16")
+    write_mono(right, audio, encoding="pcm16")
+    dest = tmp_path / "out" / "A.wav"
+    pair = Pair(left=left, right=right, normalized="A", output_name="A.wav")
+    paths: list[str] = []
+    paths_lock = threading.Lock()
+    first_entered = threading.Event()
+    release = threading.Event()
+
+    def wrapped(path, **kwargs):
+        with paths_lock:
+            paths.append(Path(path).name)
+            first = len(paths) == 1
+        if first:
+            first_entered.set()
+            assert release.wait(5)
+        return write_interleaved_wav(path, **kwargs)
+
+    monkeypatch.setattr("scg_stereorejoin.rejoin.write_interleaved_wav", wrapped)
+
+    errors: list[BaseException] = []
+
+    def once():
+        try:
+            rejoin_pair(
+                pair,
+                dest,
+                pad=False,
+                overwrite=True,
+                delete_sources=False,
+                dry_run=False,
+                large_container=RF64,
+                chunk_frames=4,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=once)
+    second = threading.Thread(target=once)
+    first.start()
+    assert first_entered.wait(5)
+    second.start()
+    for _ in range(100):
+        with paths_lock:
+            if len(paths) >= 2:
+                break
+        release.wait(0.02)
+    release.set()
+    first.join(5)
+    second.join(5)
+    assert len(paths) >= 2
+    assert paths[0] != paths[1]
+    assert errors == []
+    info = read_wav(dest)
+    assert read_audio(dest, info) == reference_interleave(audio, audio, 2)
+    assert not list(dest.parent.glob("*.partial"))
+    assert not list(dest.parent.glob(".*.partial"))
+
+
+def test_delete_sources_waits_until_the_output_verifies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    audio = pattern_bytes(2, 4, 5)
+    write_mono(tmp_path / "A.L.wav", audio, encoding="pcm16")
+    write_mono(tmp_path / "A.R.wav", audio, encoding="pcm16")
+
+    real_replace = os.replace
+
+    def replace_and_corrupt(src, dst):
+        real_replace(src, dst)
+        Path(dst).write_bytes(b"not a wav")
+
+    monkeypatch.setattr("scg_stereorejoin.rejoin.os.replace", replace_and_corrupt)
+    report = join_folder(tmp_path, tmp_path / "out", delete_sources=True)
+    assert (tmp_path / "A.L.wav").is_file()
+    assert (tmp_path / "A.R.wav").is_file()
+    assert not report.ok
+    assert report.joined == []

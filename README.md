@@ -103,8 +103,8 @@ scg-stereorejoin [options] PATH...
 | `--patterns-file FILE` | One `LEFT/RIGHT` pair per line. `#` starts a comment. Do not indent lines; the space in ` L/ R` is part of the pattern. |
 | `--no-default-patterns` | Use only the patterns you passed. |
 | `--pad` | Lengths differ: extend the shorter side with zero bytes (silence for integer PCM and for float) and warn. |
-| `--overwrite` | Replace an output file that is already there. |
-| `--delete-sources` | Delete the two mono files after that pair has been written. |
+| `--overwrite` | Replace an output file that is already there. This never replaces an input WAV from the same batch. |
+| `--delete-sources` | Delete the two mono files after that pair's output is written and verified. |
 | `--bw64` | Use a BW64 container instead of RF64 when the output is larger than 4 GB. |
 | `-n`, `--dry-run` | Print the plan, including refusals, and write nothing. |
 | `--json` | Print a JSON report. The exit code is unchanged. |
@@ -122,9 +122,10 @@ A pair is refused, and no stereo file is written, when:
 - the lengths differ and `--pad` was not set
 - the output path already exists and `--overwrite` was not set
 - two pairs would write the same path
+- the output path is any input WAV in this batch, even when `--overwrite` is set
 - the data chunk is truncated or the file is not RIFF, RF64, or BW64 WAVE
 
-The rest of the batch continues. A `.wav.partial` file is removed if a write fails; the finished name is only published with a rename after the data is on disk.
+The whole batch is planned before anything is written, and the rest of the batch continues after a refusal. Each output is written to a uniquely named temporary file in the destination folder, created with an exclusive open so a second run cannot share it and an existing `*.partial` file is left alone. That temporary file is removed if a write fails. The finished name is published with a rename only after the data is on disk, and `--delete-sources` runs only after that file verifies.
 
 ## Pairing
 
