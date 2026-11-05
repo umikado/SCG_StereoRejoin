@@ -311,6 +311,8 @@ def rejoin_pair(
                 left = read_wav_handle(pair.left, left_fh, left_stat.st_size)
                 right_stat = os.fstat(right_fh.fileno())
                 right = read_wav_handle(pair.right, right_fh, right_stat.st_size)
+                left_freeze = _freeze_handle(left_fh, left.data_offset, left.data_size)
+                right_freeze = _freeze_handle(right_fh, right.data_offset, right.data_size)
             except WavError as exc:
                 raise PairRefused(str(exc)) from exc
             except OSError as exc:
@@ -322,6 +324,8 @@ def rejoin_pair(
                 right,
                 left_fh,
                 right_fh,
+                left_freeze,
+                right_freeze,
                 pad=pad,
                 overwrite=overwrite,
                 delete_sources=delete_sources,
@@ -342,6 +346,8 @@ def _rejoin_parsed(
     right: WavInfo,
     left_fh,
     right_fh,
+    left_freeze: "_HandleFreeze",
+    right_freeze: "_HandleFreeze",
     *,
     pad: bool,
     overwrite: bool,
@@ -419,6 +425,10 @@ def _rejoin_parsed(
             chunk_frames=chunk_frames,
             left_handle=left_fh,
             right_handle=right_fh,
+        )
+        _require_handle_unchanged(left_fh, left_freeze, pair.left, written.left.audio_sha256 if written.left else "")
+        _require_handle_unchanged(
+            right_fh, right_freeze, pair.right, written.right.audio_sha256 if written.right else ""
         )
         identity = _file_identity(temporary)
         lock_fd = _acquire_output_lock(dest)
@@ -699,6 +709,83 @@ def _output_still_ours(dest: Path, identity: tuple[int, int]) -> bool:
     return (st.st_dev, st.st_ino) == identity
 
 
+@dataclass(frozen=True)
+class _HandleFreeze:
+    """Stat, header bytes, and audio digest from the handle that was parsed."""
+
+    dev: int
+    ino: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    header: bytes
+    audio_sha256: str
+
+
+def _ctime_ns(stat) -> int:
+    value = getattr(stat, "st_ctime_ns", None)
+    if value is not None:
+        return int(value)
+    return int(stat.st_ctime * 1_000_000_000)
+
+
+def _freeze_handle(handle, data_offset: int, audio_bytes: int) -> _HandleFreeze:
+    stat = os.fstat(handle.fileno())
+    position = handle.tell()
+    handle.seek(0)
+    header = handle.read(data_offset)
+    if len(header) != data_offset:
+        handle.seek(position)
+        raise WavError("header ended early while it was being snapshotted")
+    audio_sha256 = hash_region(handle, data_offset, audio_bytes)
+    handle.seek(position)
+    return _HandleFreeze(
+        dev=stat.st_dev,
+        ino=stat.st_ino,
+        size=stat.st_size,
+        mtime_ns=stat.st_mtime_ns,
+        ctime_ns=_ctime_ns(stat),
+        header=header,
+        audio_sha256=audio_sha256,
+    )
+
+
+def _require_handle_unchanged(handle, frozen: _HandleFreeze, path: Path, streamed_audio_sha256: str) -> None:
+    """Abort when the open inode, its header, or its samples changed after the parse.
+
+    ``mtime_ns`` and ``ctime_ns`` can stay put when a same-sized rewrite lands
+    inside one timestamp tick and ``utime`` is then asked to store the times
+    the inode already has. The audio digest catches that case.
+    """
+    stat = os.fstat(handle.fileno())
+    now = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, _ctime_ns(stat))
+    was = (frozen.dev, frozen.ino, frozen.size, frozen.mtime_ns, frozen.ctime_ns)
+    position = handle.tell()
+    handle.seek(0)
+    header = handle.read(len(frozen.header))
+    handle.seek(position)
+    if now != was or header != frozen.header or streamed_audio_sha256 != frozen.audio_sha256:
+        raise PairRefused(f"{path} changed while it was being read")
+
+
+def _exclusive_trash_destination(trash_dir: Path, source_name: str) -> Path:
+    """Return a path that does not exist, inside a directory created with mkdir.
+
+    ``os.rename`` onto an existing file replaces it on POSIX. A fresh directory
+    from ``os.mkdir`` cannot already contain ``source_name``, and a collision
+    on the directory name is retried instead of overwritten.
+    """
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    for attempt in range(128):
+        folder = trash_dir / f"{os.urandom(4).hex()}-{attempt}"
+        try:
+            os.mkdir(folder)
+        except FileExistsError:
+            continue
+        return folder / source_name
+    raise OSError(17, "could not create a trash directory")
+
+
 def _retire_source(source: Path, view: SourceView | None, warnings: list[str]) -> None:
     """Move ``source`` aside, then keep it only if it is still the file we read.
 
@@ -709,11 +796,16 @@ def _retire_source(source: Path, view: SourceView | None, warnings: list[str]) -
         warnings.append(f"skipped deleting {source}: file changed after it was read")
         return
     trash_dir = source.parent / ".scg_stereorejoin_trash" / _RUN_ID
+    trash: Path | None = None
     try:
-        trash_dir.mkdir(parents=True, exist_ok=True)
-        trash = trash_dir / f"{source.name}.{os.urandom(4).hex()}"
+        trash = _exclusive_trash_destination(trash_dir, source.name)
         os.rename(source, trash)
     except OSError as exc:
+        if trash is not None and trash.parent.is_dir() and not any(trash.parent.iterdir()):
+            try:
+                trash.parent.rmdir()
+            except OSError:
+                pass
         warnings.append(f"skipped deleting {source}: {exc.strerror}")
         return
     if _quarantine_matches(trash, view):

@@ -839,3 +839,154 @@ def test_sources_stay_when_output_is_replaced_after_verify(tmp_path: Path, monke
     assert report.joined
     warning = " ".join(report.joined[0].warnings)
     assert "output" in warning.lower()
+
+
+def _rewrite_inplace(
+    path: Path,
+    audio: bytes,
+    *,
+    rate: int = 48_000,
+    bext: bytes | None = None,
+    restore_mtime: bool = False,
+) -> None:
+    """Overwrite the same inode. ``wb`` would also keep it; ``r+b`` makes that explicit."""
+    stamp = path.stat()
+    staged = Path(str(path) + ".builder")
+    write_mono(staged, audio, encoding="pcm16", rate=rate, bext=bext)
+    payload = staged.read_bytes()
+    staged.unlink()
+    with path.open("r+b") as handle:
+        handle.seek(0)
+        handle.write(payload)
+        handle.truncate()
+    if restore_mtime:
+        os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+
+
+def _join_with_inplace_rewrite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rewrite) -> object:
+    from scg_stereorejoin import rejoin as rejoin_mod
+
+    audio = pattern_bytes(2, 4, 2)
+    left = tmp_path / "A.L.wav"
+    right = tmp_path / "A.R.wav"
+    bext = demo_bext("left", time_reference=100)
+    write_mono(left, audio, encoding="pcm16", bext=bext)
+    write_mono(right, audio, encoding="pcm16", bext=demo_bext("right", time_reference=100))
+    real_write = rejoin_mod.write_interleaved_wav
+
+    def write_after_rewrite(path, **kwargs):
+        rewrite(left)
+        return real_write(path, **kwargs)
+
+    monkeypatch.setattr(rejoin_mod, "write_interleaved_wav", write_after_rewrite)
+    return join_folder(tmp_path, tmp_path / "out", delete_sources=True)
+
+
+def _assert_rewrite_aborted(tmp_path: Path, report, left_audio: bytes, *, rate: int, time_reference: int) -> None:
+    left = tmp_path / "A.L.wav"
+    right = tmp_path / "A.R.wav"
+    assert not report.ok
+    assert report.joined == []
+    assert report.refused
+    assert "changed" in report.refused[0].reason
+    assert not (tmp_path / "out" / "A.wav").exists()
+    assert list((tmp_path / "out").glob("*.partial")) == []
+    assert list(tmp_path.rglob(".*.partial")) == []
+    assert left.is_file()
+    assert right.is_file()
+    info = read_wav(left)
+    assert info.frames == len(left_audio) // 2
+    assert info.fmt.sample_rate == rate
+    assert bext_time_reference(info.chunk(b"bext").data) == time_reference
+    assert read_audio(left, info) == left_audio
+    assert not any(path.parent.name == ".scg_stereorejoin_trash" for path in (left, right))
+
+
+def test_inplace_length_change_between_parse_and_read_aborts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    longer = pattern_bytes(2, 8, 9)
+    report = _join_with_inplace_rewrite(
+        tmp_path,
+        monkeypatch,
+        lambda left: _rewrite_inplace(left, longer, rate=48_000, bext=demo_bext("new", time_reference=100)),
+    )
+    _assert_rewrite_aborted(tmp_path, report, longer, rate=48_000, time_reference=100)
+
+
+def test_inplace_sample_rate_change_between_parse_and_read_aborts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    audio = pattern_bytes(2, 4, 9)
+    report = _join_with_inplace_rewrite(
+        tmp_path,
+        monkeypatch,
+        lambda left: _rewrite_inplace(left, audio, rate=44_100, bext=demo_bext("new", time_reference=100)),
+    )
+    _assert_rewrite_aborted(tmp_path, report, audio, rate=44_100, time_reference=100)
+
+
+def test_inplace_bext_time_reference_change_between_parse_and_read_aborts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    audio = pattern_bytes(2, 4, 9)
+    report = _join_with_inplace_rewrite(
+        tmp_path,
+        monkeypatch,
+        lambda left: _rewrite_inplace(left, audio, rate=48_000, bext=demo_bext("new", time_reference=999)),
+    )
+    _assert_rewrite_aborted(tmp_path, report, audio, rate=48_000, time_reference=999)
+
+
+def test_inplace_same_size_same_mtime_rewrite_aborts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Same length and restored mtime still counts as a change.
+
+    A same-sized rewrite can land inside one timestamp tick, and ``os.utime``
+    of the times the inode already has does not always move ``ctime_ns``.
+    The audio digest taken at parse time is what makes this detectable.
+    """
+    audio = pattern_bytes(2, 4, 9)
+    report = _join_with_inplace_rewrite(
+        tmp_path,
+        monkeypatch,
+        lambda left: _rewrite_inplace(
+            left,
+            audio,
+            rate=48_000,
+            bext=demo_bext("left", time_reference=100),
+            restore_mtime=True,
+        ),
+    )
+    _assert_rewrite_aborted(tmp_path, report, audio, rate=48_000, time_reference=100)
+
+
+def test_trash_suffix_collision_keeps_both_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Two retires that draw the same trash suffix must not overwrite each other."""
+    import hashlib
+
+    from scg_stereorejoin import rejoin as rejoin_mod
+    from scg_stereorejoin.wav import SourceView
+
+    monkeypatch.setattr(rejoin_mod.os, "urandom", lambda n: b"\xab" * n)
+    first = pattern_bytes(2, 4, 1)
+    second = pattern_bytes(2, 4, 2)
+    path = tmp_path / "Take.L.wav"
+    warnings: list[str] = []
+
+    def view_for(target: Path) -> SourceView:
+        info = read_wav(target)
+        st = target.stat()
+        payload = read_audio(target, info)
+        return SourceView(
+            dev=st.st_dev,
+            ino=st.st_ino,
+            size=st.st_size,
+            mtime_ns=st.st_mtime_ns,
+            offset=info.data_offset,
+            audio_bytes=len(payload),
+            audio_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+
+    write_mono(path, first, encoding="pcm16")
+    rejoin_mod._retire_source(path, view_for(path), warnings)
+    write_mono(path, second, encoding="pcm16")
+    rejoin_mod._retire_source(path, view_for(path), warnings)
+    found = _find_mono(tmp_path, first)
+    assert found, "the first trashed file was overwritten"
+    assert _find_mono(tmp_path, second)
