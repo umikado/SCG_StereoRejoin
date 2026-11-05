@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scg-stereorejoin"
+version = "1.0.0"
+description = "Re-join Pro Tools, Cubase, and Nuendo split dual-mono WAVs into bit-exact interleaved stereo."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "umikado" }]
+keywords = ["wav", "bwf", "ixml", "protools", "cubase", "nuendo", "stereo"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dnd = ["tkinterdnd2"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+scg-stereorejoin = "scg_stereorejoin.cli:main"
+scg-stereorejoin-gui = "scg_stereorejoin.gui:main"
+
+[project.urls]
+Homepage = "https://github.com/umikado/SCG_StereoRejoin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
