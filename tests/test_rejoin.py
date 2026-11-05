@@ -530,20 +530,178 @@ def test_overlapping_writes_do_not_share_a_partial_path(tmp_path: Path, monkeypa
     assert not list(dest.parent.glob(".*.partial"))
 
 
+def _hook_publish(monkeypatch: pytest.MonkeyPatch, after_publish) -> None:
+    """Run ``after_publish`` once the temp file has been given its final name.
+
+    Hooks both ``os.replace`` and ``os.link`` so the check does not depend on
+    which publish primitive the no-overwrite path uses.
+    """
+    real_replace = os.replace
+    real_link = os.link
+
+    def replace(src, dst, *args, **kwargs):
+        real_replace(src, dst, *args, **kwargs)
+        after_publish(Path(dst))
+
+    def link(src, dst, *args, **kwargs):
+        real_link(src, dst, *args, **kwargs)
+        after_publish(Path(dst))
+
+    monkeypatch.setattr("scg_stereorejoin.rejoin.os.replace", replace)
+    monkeypatch.setattr("scg_stereorejoin.rejoin.os.link", link)
+
+
 def test_delete_sources_waits_until_the_output_verifies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     audio = pattern_bytes(2, 4, 5)
     write_mono(tmp_path / "A.L.wav", audio, encoding="pcm16")
     write_mono(tmp_path / "A.R.wav", audio, encoding="pcm16")
 
-    real_replace = os.replace
+    def corrupt(dst: Path) -> None:
+        dst.write_bytes(b"not a wav")
 
-    def replace_and_corrupt(src, dst):
-        real_replace(src, dst)
-        Path(dst).write_bytes(b"not a wav")
-
-    monkeypatch.setattr("scg_stereorejoin.rejoin.os.replace", replace_and_corrupt)
+    _hook_publish(monkeypatch, corrupt)
     report = join_folder(tmp_path, tmp_path / "out", delete_sources=True)
     assert (tmp_path / "A.L.wav").is_file()
     assert (tmp_path / "A.R.wav").is_file()
     assert not report.ok
     assert report.joined == []
+
+
+def test_no_overwrite_publish_does_not_clobber_a_concurrent_writer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Two joins that both passed the exists() check must not replace each other."""
+    audio_a = pattern_bytes(2, 8, 1)
+    audio_b = pattern_bytes(2, 8, 2)
+    left_a = tmp_path / "a" / "Take.L.wav"
+    right_a = tmp_path / "a" / "Take.R.wav"
+    left_b = tmp_path / "b" / "Take.L.wav"
+    right_b = tmp_path / "b" / "Take.R.wav"
+    write_mono(left_a, audio_a, encoding="pcm16")
+    write_mono(right_a, audio_a, encoding="pcm16")
+    write_mono(left_b, audio_b, encoding="pcm16")
+    write_mono(right_b, audio_b, encoding="pcm16")
+    dest = tmp_path / "out" / "Take.wav"
+    pair_a = Pair(left=left_a, right=right_a, normalized="Take", output_name="Take.wav")
+    pair_b = Pair(left=left_b, right=right_b, normalized="Take", output_name="Take.wav")
+    barrier = threading.Barrier(2)
+
+    def wrapped(path, **kwargs):
+        barrier.wait(5)
+        return write_interleaved_wav(path, **kwargs)
+
+    monkeypatch.setattr("scg_stereorejoin.rejoin.write_interleaved_wav", wrapped)
+    outcomes: list[tuple] = []
+    lock = threading.Lock()
+
+    def once(pair: Pair):
+        try:
+            item = rejoin_pair(
+                pair,
+                dest,
+                pad=False,
+                overwrite=False,
+                delete_sources=True,
+                dry_run=False,
+                large_container=RF64,
+                chunk_frames=4,
+            )
+        except Exception as exc:
+            with lock:
+                outcomes.append(("err", pair, exc))
+            return
+        with lock:
+            outcomes.append(("ok", pair, item))
+
+    threads = [threading.Thread(target=once, args=(pair,)) for pair in (pair_a, pair_b)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert not any(thread.is_alive() for thread in threads)
+    oks = [item for item in outcomes if item[0] == "ok"]
+    errs = [item for item in outcomes if item[0] == "err"]
+    assert len(oks) == 1
+    assert len(errs) == 1
+    assert "exist" in str(errs[0][2]).lower()
+    winner = oks[0][1]
+    loser = errs[0][1]
+    assert not winner.left.exists()
+    assert not winner.right.exists()
+    assert loser.left.is_file()
+    assert loser.right.is_file()
+    info = read_wav(dest)
+    got = read_audio(dest, info)
+    expected = {
+        left_a: reference_interleave(audio_a, audio_a, 2),
+        left_b: reference_interleave(audio_b, audio_b, 2),
+    }
+    assert got == expected[winner.left]
+    assert got != expected[loser.left]
+
+
+def test_delete_sources_rejects_audio_corruption_that_keeps_the_header(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Flipping a sample and leaving the header intact must keep the source files."""
+    audio = pattern_bytes(2, 8, 5)
+    write_mono(tmp_path / "A.L.wav", audio, encoding="pcm16")
+    write_mono(tmp_path / "A.R.wav", audio, encoding="pcm16")
+    def flip_last_audio_byte(dst: Path) -> None:
+        blob = bytearray(dst.read_bytes())
+        blob[-1] ^= 0xFF
+        dst.write_bytes(bytes(blob))
+
+    _hook_publish(monkeypatch, flip_last_audio_byte)
+    report = join_folder(tmp_path, tmp_path / "out", delete_sources=True)
+    assert (tmp_path / "A.L.wav").is_file()
+    assert (tmp_path / "A.R.wav").is_file()
+    assert not report.ok
+    assert report.joined == []
+
+
+def test_verification_is_tied_to_the_published_inode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A same-length replacement at the output path is not the file this run wrote."""
+    audio = pattern_bytes(2, 8, 4)
+    write_mono(tmp_path / "A.L.wav", audio, encoding="pcm16")
+    write_mono(tmp_path / "A.R.wav", audio, encoding="pcm16")
+    real_replace = os.replace
+
+    def swap_inode(dst: Path) -> None:
+        original = dst.stat()
+        payload = dst.read_bytes()
+        swapped_path = Path(str(dst) + ".swap")
+        swapped_path.write_bytes(payload)
+        swapped = swapped_path.stat()
+        assert (original.st_dev, original.st_ino) != (swapped.st_dev, swapped.st_ino)
+        real_replace(swapped_path, dst)
+
+    _hook_publish(monkeypatch, swap_inode)
+    report = join_folder(tmp_path, tmp_path / "out", delete_sources=True)
+    assert (tmp_path / "A.L.wav").is_file()
+    assert (tmp_path / "A.R.wav").is_file()
+    assert not report.ok
+    assert report.joined == []
+
+
+def test_delete_sources_skips_a_source_rewritten_after_it_was_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A re-export that lands on the source path after the read must not be deleted."""
+    audio = pattern_bytes(2, 8, 3)
+    rewritten = pattern_bytes(2, 8, 9)
+    left = tmp_path / "A.L.wav"
+    right = tmp_path / "A.R.wav"
+    write_mono(left, audio, encoding="pcm16")
+    write_mono(right, audio, encoding="pcm16")
+    def reexport_left(_dst: Path) -> None:
+        stamp = left.stat()
+        write_mono(left, rewritten, encoding="pcm16")
+        os.utime(left, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+
+    _hook_publish(monkeypatch, reexport_left)
+    report = join_folder(tmp_path, tmp_path / "out", delete_sources=True)
+    assert left.is_file()
+    kept = read_wav(left)
+    assert read_audio(left, kept) == rewritten
+    assert not right.exists()
+    assert report.joined
+    warning = " ".join(report.joined[0].warnings)
+    assert "changed" in warning
+    assert left.name in warning
+    info = read_wav(report.joined[0].output)
+    assert read_audio(report.joined[0].output, info) == reference_interleave(audio, audio, 2)

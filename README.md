@@ -104,7 +104,7 @@ scg-stereorejoin [options] PATH...
 | `--no-default-patterns` | Use only the patterns you passed. |
 | `--pad` | Lengths differ: extend the shorter side with zero bytes (silence for integer PCM and for float) and warn. |
 | `--overwrite` | Replace an output file that is already there. This never replaces an input WAV from the same batch. |
-| `--delete-sources` | Delete the two mono files after that pair's output is written and verified. |
+| `--delete-sources` | Delete each mono file after the output verifies, and only if that source is still the version that was read. |
 | `--bw64` | Use a BW64 container instead of RF64 when the output is larger than 4 GB. |
 | `-n`, `--dry-run` | Print the plan, including refusals, and write nothing. |
 | `--json` | Print a JSON report. The exit code is unchanged. |
@@ -125,7 +125,7 @@ A pair is refused, and no stereo file is written, when:
 - the output path is any input WAV in this batch, even when `--overwrite` is set
 - the data chunk is truncated or the file is not RIFF, RF64, or BW64 WAVE
 
-The whole batch is planned before anything is written, and the rest of the batch continues after a refusal. Each output is written to a uniquely named temporary file in the destination folder, created with an exclusive open so a second run cannot share it and an existing `*.partial` file is left alone. That temporary file is removed if a write fails. The finished name is published with a rename only after the data is on disk, and `--delete-sources` runs only after that file verifies.
+The whole batch is planned before anything is written, and the rest of the batch continues after a refusal. Each output is written to a uniquely named temporary file in the destination folder, created with an exclusive open so a second run cannot share it and an existing `*.partial` file is left alone. That temporary file is removed if a write fails. Without `--overwrite`, the finished name is published with a hard link that fails if the name already exists, so two runs cannot replace each other. `--overwrite` still replaces the name atomically. `--delete-sources` runs only after the published inode is the file this run wrote and its audio bytes match the samples that were read. A source that changed size, mtime, inode, or audio content is left in place, with a warning.
 
 ## Pairing
 

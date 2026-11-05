@@ -78,7 +78,7 @@ def build_parser():
     parser.add_argument(
         "--delete-sources",
         action="store_true",
-        help="delete the two mono files after the stereo file is written and verified",
+        help="delete the two mono files after the stereo file verifies, if those sources are unchanged",
     )
     parser.add_argument(
         "--bw64",

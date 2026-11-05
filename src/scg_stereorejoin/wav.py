@@ -11,6 +11,7 @@ sizes. Small files stay RIFF/WAVE so older software can open them.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import struct
 from dataclasses import dataclass
@@ -149,11 +150,27 @@ class WavInfo:
         return None
 
 
+@dataclass(frozen=True)
+class SourceView:
+    """Identity and audio digest of one mono file, taken while it was read."""
+
+    dev: int
+    ino: int
+    size: int
+    mtime_ns: int
+    offset: int
+    audio_bytes: int
+    audio_sha256: str
+
+
 @dataclass
 class WriteResult:
     container: bytes
     frames: int
     data_size: int
+    audio_sha256: str = ""
+    left: SourceView | None = None
+    right: SourceView | None = None
 
 
 def make_fmt(
@@ -380,55 +397,64 @@ def interleave(left: bytes, right: bytes, width: int) -> bytes:
 def read_wav(path: Path | str) -> WavInfo:
     path = Path(path)
     try:
-        file_size = path.stat().st_size
+        handle = path.open("rb")
     except OSError as exc:
         raise WavError(f"{path}: {exc.strerror}") from exc
-    with path.open("rb") as handle:
-        header = handle.read(12)
-        if len(header) < 12:
-            raise WavError(f"{path}: file is too small to be a WAV")
-        ident, size, form = struct.unpack("<4sI4s", header)
-        if ident == RIFX:
-            raise WavError(f"{path}: big-endian RIFX WAVE is not supported")
-        if ident not in (RIFF, RF64, BW64) or form != WAVE:
-            raise WavError(
-                f"{path}: not a RIFF, RF64, or BW64 WAVE file (got {ident!r} / {form!r})"
-            )
-        limit = file_size
-        if ident == RIFF and size != UINT32_MAX:
-            limit = min(file_size, 8 + size)
-        ds64: Ds64 | None = None
-        chunks: list[Chunk] = []
-        data_offset: int | None = None
-        data_size: int | None = None
-        first = True
-        while handle.tell() + 8 <= limit:
-            chunk_header = handle.read(8)
-            if len(chunk_header) < 8:
-                break
-            cid, csize = struct.unpack("<4sI", chunk_header)
-            if first and ident in (RF64, BW64) and cid != b"ds64":
-                raise WavError(f"{path}: {ident.decode()} file must start with a ds64 chunk")
-            first = False
-            if cid == b"ds64":
-                blob = _read_exact(handle, csize, path, cid)
-                ds64 = _parse_ds64(blob, path)
-                _consume_pad(handle, csize, limit)
-                if ds64.riff_size:
-                    limit = min(file_size, 8 + ds64.riff_size)
-                continue
-            actual = csize
-            if csize == UINT32_MAX:
-                actual = _resolve_sentinel(cid, ds64, path)
-            if cid == b"data":
-                data_offset = handle.tell()
-                data_size = actual
-                _skip(handle, actual, path, file_size)
-                _consume_pad(handle, actual, limit)
-                continue
-            blob = _read_exact(handle, actual, path, cid)
-            chunks.append(Chunk(cid, blob))
+    with handle:
+        try:
+            file_size = os.fstat(handle.fileno()).st_size
+        except OSError as exc:
+            raise WavError(f"{path}: {exc.strerror}") from exc
+        return read_wav_handle(path, handle, file_size)
+
+
+def read_wav_handle(path: Path, handle, file_size: int) -> WavInfo:
+    """Parse a WAVE file from an already-open binary handle positioned at byte 0."""
+    header = handle.read(12)
+    if len(header) < 12:
+        raise WavError(f"{path}: file is too small to be a WAV")
+    ident, size, form = struct.unpack("<4sI4s", header)
+    if ident == RIFX:
+        raise WavError(f"{path}: big-endian RIFX WAVE is not supported")
+    if ident not in (RIFF, RF64, BW64) or form != WAVE:
+        raise WavError(
+            f"{path}: not a RIFF, RF64, or BW64 WAVE file (got {ident!r} / {form!r})"
+        )
+    limit = file_size
+    if ident == RIFF and size != UINT32_MAX:
+        limit = min(file_size, 8 + size)
+    ds64: Ds64 | None = None
+    chunks: list[Chunk] = []
+    data_offset: int | None = None
+    data_size: int | None = None
+    first = True
+    while handle.tell() + 8 <= limit:
+        chunk_header = handle.read(8)
+        if len(chunk_header) < 8:
+            break
+        cid, csize = struct.unpack("<4sI", chunk_header)
+        if first and ident in (RF64, BW64) and cid != b"ds64":
+            raise WavError(f"{path}: {ident.decode()} file must start with a ds64 chunk")
+        first = False
+        if cid == b"ds64":
+            blob = _read_exact(handle, csize, path, cid)
+            ds64 = _parse_ds64(blob, path)
+            _consume_pad(handle, csize, limit)
+            if ds64.riff_size:
+                limit = min(file_size, 8 + ds64.riff_size)
+            continue
+        actual = csize
+        if csize == UINT32_MAX:
+            actual = _resolve_sentinel(cid, ds64, path)
+        if cid == b"data":
+            data_offset = handle.tell()
+            data_size = actual
+            _skip(handle, actual, path, file_size)
             _consume_pad(handle, actual, limit)
+            continue
+        blob = _read_exact(handle, actual, path, cid)
+        chunks.append(Chunk(cid, blob))
+        _consume_pad(handle, actual, limit)
     if data_offset is None or data_size is None:
         raise WavError(f"{path}: WAVE file has no data chunk")
     fmt_chunk = next((item for item in chunks if item.ident == b"fmt "), None)
@@ -451,6 +477,22 @@ def read_wav(path: Path | str) -> WavInfo:
         data_remainder=remainder,
         ds64=ds64,
     )
+
+
+def hash_region(handle, offset: int, nbytes: int) -> str:
+    """SHA-256 of ``nbytes`` bytes at ``offset``, read from this handle only."""
+    if nbytes < 0:
+        raise WavError("audio length cannot be negative")
+    handle.seek(offset)
+    digest = hashlib.sha256()
+    remaining = nbytes
+    while remaining:
+        blob = handle.read(min(1024 * 1024, remaining))
+        if len(blob) != min(remaining, 1024 * 1024):
+            raise WavError("audio data is truncated")
+        digest.update(blob)
+        remaining -= len(blob)
+    return digest.hexdigest()
 
 
 def read_audio(path: Path | str, info: WavInfo) -> bytes:
@@ -560,7 +602,7 @@ def write_interleaved_wav(
             large_container=large_container,
             force_container=force_container,
         )
-        _stream_interleave(
+        audio_sha256, left_view, right_view = _stream_interleave(
             handle,
             left_path=left_path,
             left_offset=left_offset,
@@ -573,7 +615,14 @@ def write_interleaved_wav(
         )
         if data_size & 1:
             handle.write(b"\x00")
-    return WriteResult(container=container, frames=frames, data_size=data_size)
+    return WriteResult(
+        container=container,
+        frames=frames,
+        data_size=data_size,
+        audio_sha256=audio_sha256,
+        left=left_view,
+        right=right_view,
+    )
 
 
 def _write_header(
@@ -637,12 +686,17 @@ def _stream_interleave(
     right_frames: int,
     width: int,
     chunk_frames: int,
-) -> None:
+) -> tuple[str, SourceView, SourceView]:
     frames = max(left_frames, right_frames)
     produced = 0
     left_left = left_frames
     right_left = right_frames
+    audio_hash = hashlib.sha256()
+    left_hash = hashlib.sha256()
+    right_hash = hashlib.sha256()
     with left_path.open("rb") as left_handle, right_path.open("rb") as right_handle:
+        left_stat = os.fstat(left_handle.fileno())
+        right_stat = os.fstat(right_handle.fileno())
         left_handle.seek(left_offset)
         right_handle.seek(right_offset)
         while produced < frames:
@@ -651,14 +705,35 @@ def _stream_interleave(
             take_right = min(count, right_left)
             left_bytes = _read_frames(left_handle, take_left, width, left_path)
             right_bytes = _read_frames(right_handle, take_right, width, right_path)
+            left_hash.update(left_bytes)
+            right_hash.update(right_bytes)
             if take_left < count:
                 left_bytes += bytes((count - take_left) * width)
             if take_right < count:
                 right_bytes += bytes((count - take_right) * width)
-            handle.write(interleave(left_bytes, right_bytes, width))
+            interleaved = interleave(left_bytes, right_bytes, width)
+            audio_hash.update(interleaved)
+            handle.write(interleaved)
             left_left -= take_left
             right_left -= take_right
             produced += count
+    return (
+        audio_hash.hexdigest(),
+        _source_view(left_stat, left_offset, left_frames * width, left_hash.hexdigest()),
+        _source_view(right_stat, right_offset, right_frames * width, right_hash.hexdigest()),
+    )
+
+
+def _source_view(stat, offset: int, audio_bytes: int, audio_sha256: str) -> SourceView:
+    return SourceView(
+        dev=stat.st_dev,
+        ino=stat.st_ino,
+        size=stat.st_size,
+        mtime_ns=stat.st_mtime_ns,
+        offset=offset,
+        audio_bytes=audio_bytes,
+        audio_sha256=audio_sha256,
+    )
 
 
 def _read_frames(handle, frames: int, width: int, path: Path) -> bytes:

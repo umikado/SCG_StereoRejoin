@@ -22,13 +22,16 @@ from scg_stereorejoin.wav import (
     RF64,
     Chunk,
     Fmt,
+    SourceView,
     WavError,
     WavInfo,
     build_fact,
     build_fmt,
     container_for,
     container_label,
+    hash_region,
     read_wav,
+    read_wav_handle,
     write_interleaved_wav,
 )
 
@@ -364,23 +367,29 @@ def rejoin_pair(
             large_container=large_container,
             chunk_frames=chunk_frames,
         )
-        os.replace(temporary, dest)
+        identity = _file_identity(temporary)
+        _publish(temporary, dest, overwrite=overwrite)
     finally:
         if temporary.exists():
             temporary.unlink()
     try:
         _verify_published(
             dest,
+            identity=identity,
             frames=written.frames,
             sample_rate=left.fmt.sample_rate,
             bits_per_sample=left.fmt.bits_per_sample,
+            audio_sha256=written.audio_sha256,
         )
     except (WavError, OSError) as exc:
         raise PairRefused(f"output failed verification: {dest}: {exc}") from exc
 
     post_errors: list[str] = []
     if delete_sources:
-        for source in (pair.left, pair.right):
+        for source, view in ((pair.left, written.left), (pair.right, written.right)):
+            if not _source_unchanged(source, view):
+                warnings.append(f"skipped deleting {source}: file changed after it was read")
+                continue
             try:
                 source.unlink()
             except OSError as exc:
@@ -587,20 +596,88 @@ def _exclusive_temp(dest: Path) -> Path:
     raise PairRefused(f"could not create a temporary file in {parent}")
 
 
-def _verify_published(path: Path, *, frames: int, sample_rate: int, bits_per_sample: int) -> None:
-    """Re-read a published stereo file before any source is deleted."""
-    info = read_wav(path)
-    problems: list[str] = []
-    if info.fmt.channels != 2:
-        problems.append(f"{info.fmt.channels} channels, expected 2")
-    if info.frames != frames:
-        problems.append(f"{info.frames} frames, expected {frames}")
-    if info.fmt.sample_rate != sample_rate:
-        problems.append(f"{info.fmt.sample_rate} Hz, expected {sample_rate}")
-    if info.fmt.bits_per_sample != bits_per_sample:
-        problems.append(f"{info.fmt.bits_per_sample} bits, expected {bits_per_sample}")
-    if problems:
-        raise WavError(f"{path}: " + "; ".join(problems))
+def _file_identity(path: Path) -> tuple[int, int]:
+    st = path.stat()
+    return (st.st_dev, st.st_ino)
+
+
+def _publish(temporary: Path, dest: Path, *, overwrite: bool) -> None:
+    """Make ``dest`` name the finished file.
+
+    Without ``overwrite``, ``os.link`` is the publish. It fails with
+    ``EEXIST`` when the name is already taken, including when another run
+    wins the race, on POSIX and on Windows. ``os.replace`` is only used
+    when replacement was requested, because on POSIX it overwrites.
+    """
+    if overwrite:
+        os.replace(temporary, dest)
+        return
+    try:
+        os.link(temporary, dest)
+    except FileExistsError as exc:
+        raise PairRefused(f"output already exists: {dest} (pass --overwrite to replace it)") from exc
+
+
+def _verify_published(
+    path: Path,
+    *,
+    identity: tuple[int, int],
+    frames: int,
+    sample_rate: int,
+    bits_per_sample: int,
+    audio_sha256: str,
+) -> None:
+    """Re-read the published inode, not whatever later appears at ``path``."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError as exc:
+        raise WavError(f"{path}: {exc.strerror}") from exc
+    try:
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != identity:
+            raise WavError(f"{path}: published file is not the file this run wrote")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            info = read_wav_handle(path, handle, st.st_size)
+            problems: list[str] = []
+            if info.fmt.channels != 2:
+                problems.append(f"{info.fmt.channels} channels, expected 2")
+            if info.frames != frames:
+                problems.append(f"{info.frames} frames, expected {frames}")
+            if info.fmt.sample_rate != sample_rate:
+                problems.append(f"{info.fmt.sample_rate} Hz, expected {sample_rate}")
+            if info.fmt.bits_per_sample != bits_per_sample:
+                problems.append(f"{info.fmt.bits_per_sample} bits, expected {bits_per_sample}")
+            if problems:
+                raise WavError(f"{path}: " + "; ".join(problems))
+            digest = hash_region(handle, info.data_offset, info.data_size)
+            if digest != audio_sha256:
+                raise WavError(f"{path}: audio bytes do not match the source files")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _source_unchanged(path: Path, view: SourceView | None) -> bool:
+    if view is None:
+        return False
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != (
+        view.dev,
+        view.ino,
+        view.size,
+        view.mtime_ns,
+    ):
+        return False
+    try:
+        with path.open("rb") as handle:
+            digest = hash_region(handle, view.offset, view.audio_bytes)
+    except (OSError, WavError):
+        return False
+    return digest == view.audio_sha256
 
 
 def _collision_key(path: Path) -> str:
