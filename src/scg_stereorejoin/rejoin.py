@@ -297,22 +297,24 @@ def rejoin_pair(
     if pair.left.resolve() == pair.right.resolve():
         raise PairRefused("left and right paths are the same file")
     try:
-        left_fh = pair.left.open("rb")
+        left_fh = pair.left.open("rb", buffering=0)
     except OSError as exc:
         raise PairRefused(f"{pair.left}: {exc.strerror}") from exc
     try:
         try:
-            right_fh = pair.right.open("rb")
+            right_fh = pair.right.open("rb", buffering=0)
         except OSError as exc:
             raise PairRefused(f"{pair.right}: {exc.strerror}") from exc
         try:
             try:
                 left_stat = os.fstat(left_fh.fileno())
-                left = read_wav_handle(pair.left, left_fh, left_stat.st_size)
+                left_header = _HeaderReader(left_fh)
+                left = read_wav_handle(pair.left, left_header, left_stat.st_size)
                 right_stat = os.fstat(right_fh.fileno())
-                right = read_wav_handle(pair.right, right_fh, right_stat.st_size)
-                left_freeze = _freeze_handle(left_fh, left.data_offset, left.data_size)
-                right_freeze = _freeze_handle(right_fh, right.data_offset, right.data_size)
+                right_header = _HeaderReader(right_fh)
+                right = read_wav_handle(pair.right, right_header, right_stat.st_size)
+                left_freeze = _freeze_handle(left_fh, left, left_stat, left_header.reads)
+                right_freeze = _freeze_handle(right_fh, right, right_stat, right_header.reads)
             except WavError as exc:
                 raise PairRefused(str(exc)) from exc
             except OSError as exc:
@@ -718,8 +720,28 @@ class _HandleFreeze:
     size: int
     mtime_ns: int
     ctime_ns: int
-    header: bytes
+    header_reads: tuple[tuple[int, bytes], ...]
     audio_sha256: str
+
+
+class _HeaderReader:
+    """Record the exact bytes consumed by the WAV parser, excluding skipped audio."""
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.reads: list[tuple[int, bytes]] = []
+
+    def read(self, count: int = -1) -> bytes:
+        offset = self.handle.tell()
+        data = self.handle.read(count)
+        self.reads.append((offset, data))
+        return data
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        return self.handle.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self.handle.tell()
 
 
 def _ctime_ns(stat) -> int:
@@ -729,23 +751,61 @@ def _ctime_ns(stat) -> int:
     return int(stat.st_ctime * 1_000_000_000)
 
 
-def _freeze_handle(handle, data_offset: int, audio_bytes: int) -> _HandleFreeze:
-    stat = os.fstat(handle.fileno())
+def _require_parse_state(initial, current, path: Path) -> None:
+    """Keep the state from before parsing rather than accepting a later rewrite.
+
+    Replacing the source path may unlink the open, unchanged inode and update
+    only its ctime. Its original header and audio remain usable; retirement
+    will separately reject the new inode at the source path.
+    """
+    before = (initial.st_dev, initial.st_ino, initial.st_size, initial.st_mtime_ns)
+    after = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+    if before == after:
+        if _ctime_ns(initial) == _ctime_ns(current):
+            return
+        if current.st_nlink < initial.st_nlink:
+            try:
+                named = path.stat()
+            except FileNotFoundError:
+                return
+            if (named.st_dev, named.st_ino) != (current.st_dev, current.st_ino):
+                return
+    raise PairRefused(f"{path} changed while it was being read")
+
+
+def _require_header_reads(handle, reads: tuple[tuple[int, bytes], ...], path: Path) -> None:
     position = handle.tell()
-    handle.seek(0)
-    header = handle.read(data_offset)
-    if len(header) != data_offset:
+    try:
+        for offset, expected in reads:
+            handle.seek(offset)
+            if handle.read(len(expected)) != expected:
+                raise PairRefused(f"{path} changed while it was being read")
+    finally:
         handle.seek(position)
-        raise WavError("header ended early while it was being snapshotted")
-    audio_sha256 = hash_region(handle, data_offset, audio_bytes)
-    handle.seek(position)
+
+
+def _freeze_handle(handle, info: WavInfo, initial_stat, parsed_reads: list[tuple[int, bytes]]) -> _HandleFreeze:
+    # Source handles are unbuffered so rereading a range checks current bytes,
+    # not a parser read-ahead buffer retained across an in-place rewrite.
+    stat = os.fstat(handle.fileno())
+    _require_parse_state(initial_stat, stat, info.path)
+    header_reads = tuple(parsed_reads)
+    position = handle.tell()
+    try:
+        _require_header_reads(handle, header_reads, info.path)
+        audio_sha256 = hash_region(handle, info.data_offset, info.data_size)
+        _require_header_reads(handle, header_reads, info.path)
+        final_stat = os.fstat(handle.fileno())
+        _require_parse_state(initial_stat, final_stat, info.path)
+    finally:
+        handle.seek(position)
     return _HandleFreeze(
-        dev=stat.st_dev,
-        ino=stat.st_ino,
-        size=stat.st_size,
-        mtime_ns=stat.st_mtime_ns,
-        ctime_ns=_ctime_ns(stat),
-        header=header,
+        dev=final_stat.st_dev,
+        ino=final_stat.st_ino,
+        size=final_stat.st_size,
+        mtime_ns=final_stat.st_mtime_ns,
+        ctime_ns=_ctime_ns(final_stat),
+        header_reads=header_reads,
         audio_sha256=audio_sha256,
     )
 
@@ -760,11 +820,10 @@ def _require_handle_unchanged(handle, frozen: _HandleFreeze, path: Path, streame
     stat = os.fstat(handle.fileno())
     now = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, _ctime_ns(stat))
     was = (frozen.dev, frozen.ino, frozen.size, frozen.mtime_ns, frozen.ctime_ns)
-    position = handle.tell()
-    handle.seek(0)
-    header = handle.read(len(frozen.header))
-    handle.seek(position)
-    if now != was or header != frozen.header or streamed_audio_sha256 != frozen.audio_sha256:
+    _require_header_reads(handle, frozen.header_reads, path)
+    final_stat = os.fstat(handle.fileno())
+    final = (final_stat.st_dev, final_stat.st_ino, final_stat.st_size, final_stat.st_mtime_ns, _ctime_ns(final_stat))
+    if now != was or final != was or streamed_audio_sha256 != frozen.audio_sha256:
         raise PairRefused(f"{path} changed while it was being read")
 
 

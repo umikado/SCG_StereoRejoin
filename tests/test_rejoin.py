@@ -990,3 +990,123 @@ def test_trash_suffix_collision_keeps_both_files(tmp_path: Path, monkeypatch: py
     found = _find_mono(tmp_path, first)
     assert found, "the first trashed file was overwritten"
     assert _find_mono(tmp_path, second)
+
+
+@pytest.mark.parametrize("change", ["length", "rate", "bext"])
+@pytest.mark.parametrize("restore_times", [False, True], ids=["timestamps", "restored-mtime-coarse-ctime"])
+def test_inplace_change_while_other_header_is_parsed_aborts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str, restore_times: bool
+):
+    """The later snapshot must not legitimize WavInfo from an earlier version."""
+    from scg_stereorejoin import rejoin as rejoin_mod
+
+    frames = 16_384
+    original = pattern_bytes(2, frames, 2)
+    changed = pattern_bytes(2, frames * (2 if change == "length" else 1), 9)
+    rate = 96_000 if change == "rate" else 48_000
+    time_reference = 999 if change == "bext" else 100
+    left, right = tmp_path / "A.L.wav", tmp_path / "A.R.wav"
+    write_mono(left, original, encoding="pcm16", bext=demo_bext("left", time_reference=100))
+    write_mono(right, original, encoding="pcm16", bext=demo_bext("right", time_reference=100))
+    stamp = left.stat()
+    right_before = right.read_bytes()
+    real_parse = rejoin_mod.read_wav_handle
+    rewritten = False
+
+    def parse(path, handle, file_size):
+        nonlocal rewritten
+        if Path(path) == right:
+            _rewrite_inplace(
+                left,
+                changed,
+                rate=rate,
+                bext=demo_bext("left", time_reference=time_reference),
+                restore_mtime=restore_times,
+            )
+            rewritten = True
+            assert left.stat().st_ino == stamp.st_ino
+            if restore_times:
+                assert left.stat().st_mtime_ns == stamp.st_mtime_ns
+        return real_parse(path, handle, file_size)
+
+    if restore_times:
+        # Fault injection isolates header-byte validation from ctime precision.
+        monkeypatch.setattr(rejoin_mod, "_ctime_ns", lambda _stat: 123)
+    monkeypatch.setattr(rejoin_mod, "read_wav_handle", parse)
+    report = join_folder(tmp_path, tmp_path / "out", delete_sources=True)
+    assert rewritten
+    _assert_rewrite_aborted(tmp_path, report, changed, rate=rate, time_reference=time_reference)
+    assert right.read_bytes() == right_before
+    assert not list(tmp_path.rglob(".scg_stereorejoin_trash"))
+
+
+def test_right_change_while_left_snapshot_is_hashed_aborts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Both handles' parse states survive the other source's snapshot work."""
+    from scg_stereorejoin import rejoin as rejoin_mod
+
+    original = pattern_bytes(2, 16_384, 2)
+    changed = pattern_bytes(2, 16_384, 9)
+    left, right = tmp_path / "A.L.wav", tmp_path / "A.R.wav"
+    for source in (left, right):
+        write_mono(source, original, encoding="pcm16", bext=demo_bext("source", time_reference=100))
+    left_before = left.read_bytes()
+    real_hash = rejoin_mod.hash_region
+    rewritten = False
+
+    def hashing(handle, offset, count):
+        nonlocal rewritten
+        if not rewritten and Path(handle.name) == left:
+            _rewrite_inplace(
+                right, changed, rate=96_000, bext=demo_bext("source", time_reference=100), restore_mtime=True
+            )
+            rewritten = True
+        return real_hash(handle, offset, count)
+
+    monkeypatch.setattr(rejoin_mod, "_ctime_ns", lambda _stat: 123)
+    monkeypatch.setattr(rejoin_mod, "hash_region", hashing)
+    report = join_folder(tmp_path, tmp_path / "out", delete_sources=True)
+    assert rewritten and not report.ok and report.refused and not report.joined
+    assert "changed" in report.refused[0].reason
+    assert left.read_bytes() == left_before
+    assert read_audio(right, read_wav(right)) == changed
+    assert read_wav(right).fmt.sample_rate == 96_000
+    assert not (tmp_path / "out" / "A.wav").exists()
+    assert not list(tmp_path.rglob(".*.partial"))
+    assert not list(tmp_path.rglob(".scg_stereorejoin_trash"))
+
+
+def test_metadata_after_audio_is_bound_to_the_parse(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A parsed tail chunk needs the same protection as a chunk before data."""
+    from scg_stereorejoin import rejoin as rejoin_mod
+
+    audio = pattern_bytes(2, 16_384, 2)
+    left, right = tmp_path / "A.L.wav", tmp_path / "A.R.wav"
+    for source in (left, right):
+        write_mono(source, audio, encoding="pcm16")
+    blob = bytearray(left.read_bytes())
+    payload = demo_bext("left", time_reference=100)
+    tail_offset = len(blob) + 8
+    blob += b"bext" + struct.pack("<I", len(payload)) + payload
+    if len(payload) & 1:
+        blob += b"\0"
+    struct.pack_into("<I", blob, 4, len(blob) - 8)
+    left.write_bytes(blob)
+    stamp = left.stat()
+    right_before = right.read_bytes()
+    real_parse = rejoin_mod.read_wav_handle
+
+    def parse(path, handle, file_size):
+        if Path(path) == right:
+            with left.open("r+b") as output:
+                output.seek(tail_offset + 338)
+                output.write(struct.pack("<Q", 999))
+            os.utime(left, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        return real_parse(path, handle, file_size)
+
+    monkeypatch.setattr(rejoin_mod, "_ctime_ns", lambda _stat: 123)
+    monkeypatch.setattr(rejoin_mod, "read_wav_handle", parse)
+    report = join_folder(tmp_path, tmp_path / "out", delete_sources=True)
+    _assert_rewrite_aborted(tmp_path, report, audio, rate=48_000, time_reference=999)
+    assert left.stat().st_size == stamp.st_size and left.stat().st_mtime_ns == stamp.st_mtime_ns
+    assert right.read_bytes() == right_before
+    assert not list(tmp_path.rglob(".scg_stereorejoin_trash"))
