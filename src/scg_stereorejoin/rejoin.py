@@ -1,4 +1,4 @@
-"""Join paired mono WAVs into one interleaved stereo WAV."""
+"""Join paired mono or single-active-channel WAVs into interleaved stereo."""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ from scg_stereorejoin.wav import (
     container_label,
     hash_region,
     read_wav_handle,
+    scan_stereo_channel,
     write_interleaved_wav,
 )
 
@@ -162,13 +163,13 @@ def destination_for(pair: Pair, output_dir: Path | None, roots: list[Path]) -> P
 
 
 def incompatibility(left: Fmt, right: Fmt) -> str | None:
-    """Return a reason the two mono formats cannot be joined without conversion."""
+    """Return a reason the two source formats cannot be joined without conversion."""
     problems: list[str] = []
-    if left.channels != 1 or right.channels != 1:
-        if left.channels != 1:
-            problems.append(f"left file has {left.channels} channels; expected mono")
-        if right.channels != 1:
-            problems.append(f"right file has {right.channels} channels; expected mono")
+    if left.channels not in (1, 2) or right.channels not in (1, 2):
+        if left.channels not in (1, 2):
+            problems.append(f"left file has {left.channels} channels; expected mono or single-active-channel stereo")
+        if right.channels not in (1, 2):
+            problems.append(f"right file has {right.channels} channels; expected mono or single-active-channel stereo")
         return "; ".join(problems)
     if left.sample_rate != right.sample_rate:
         problems.append(
@@ -184,10 +185,11 @@ def incompatibility(left: Fmt, right: Fmt) -> str | None:
         problems.append(
             f"sample format mismatch ({left.encoding_name} vs {right.encoding_name}); this tool does not convert sample format"
         )
-    if left.block_align != left.sample_width or right.block_align != right.sample_width:
+    if left.block_align != left.sample_width * left.channels or right.block_align != right.sample_width * right.channels:
         problems.append(
-            "block align does not match the sample width "
-            f"({left.block_align} vs {left.sample_width}, {right.block_align} vs {right.sample_width})"
+            "block align does not match the sample width and channel count "
+            f"({left.block_align} vs {left.sample_width * left.channels}, "
+            f"{right.block_align} vs {right.sample_width * right.channels})"
         )
     if problems:
         return "; ".join(problems)
@@ -378,7 +380,20 @@ def _rejoin_parsed(
         raise PairRefused(f"output already exists: {dest} (pass --overwrite to replace it)")
 
     warnings: list[str] = []
-    chunks, time_reference = _metadata_chunks(left, right, warnings)
+    selected = []
+    for info, handle, frozen, role, preferred in (
+        (left, left_fh, left_freeze, "left", 0),
+        (right, right_fh, right_freeze, "right", 1),
+    ):
+        channel = 0
+        if info.fmt.channels == 2:
+            channel, silent, digest = scan_stereo_channel(handle, info, preferred=preferred, chunk_frames=chunk_frames)
+            _require_handle_unchanged(handle, frozen, info.path, digest)
+            detail = "both channels are silent" if silent else "the other channel is exactly silent"
+            warnings.append(f"{role} source {info.path.name}: selected internal channel {channel + 1} for output {role.upper()} ({detail})")
+        selected.append(channel)
+    left_channel, right_channel = selected
+    chunks, time_reference = _metadata_chunks(left, right, warnings, left_channel, right_channel)
     padded_left = max(0, right.frames - left.frames)
     padded_right = max(0, left.frames - right.frames)
     if padded_left:
@@ -427,6 +442,10 @@ def _rejoin_parsed(
             chunk_frames=chunk_frames,
             left_handle=left_fh,
             right_handle=right_fh,
+            left_channels=left.fmt.channels,
+            right_channels=right.fmt.channels,
+            left_channel=left_channel,
+            right_channel=right_channel,
         )
         _require_handle_unchanged(left_fh, left_freeze, pair.left, written.left.audio_sha256 if written.left else "")
         _require_handle_unchanged(
@@ -559,7 +578,7 @@ def report_json(report: BatchReport, *, version: str) -> dict:
     }
 
 
-def _metadata_chunks(left: WavInfo, right: WavInfo, warnings: list[str]) -> tuple[list[Chunk], int | None]:
+def _metadata_chunks(left: WavInfo, right: WavInfo, warnings: list[str], left_channel: int = 0, right_channel: int = 0) -> tuple[list[Chunk], int | None]:
     bext = left.chunk(b"bext")
     right_bext = right.chunk(b"bext")
     if bext is None and right_bext is not None:
@@ -586,7 +605,12 @@ def _metadata_chunks(left: WavInfo, right: WavInfo, warnings: list[str]) -> tupl
     updated_ixml: bytes | None = None
     if ixml_chunk is not None:
         right_xml = None if ixml_from_right else (right.chunk(b"iXML").data if right.chunk(b"iXML") else None)
-        result = update_ixml(ixml_chunk.data, right_xml)
+        result = update_ixml(
+            ixml_chunk.data, right_xml,
+            left_channel=left_channel if left.fmt.channels == 2 and not ixml_from_right else None,
+            right_channel=right_channel if right.fmt.channels == 2 else None,
+            base_from_right=ixml_from_right and right.fmt.channels == 2,
+        )
         updated_ixml = result.data
         warnings.extend(result.warnings)
 

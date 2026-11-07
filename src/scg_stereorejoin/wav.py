@@ -1,8 +1,7 @@
 """RIFF / RF64 / BW64 WAVE reader and writer.
 
 Audio is raw PCM bytes. Nothing in this module resamples, dithers, or
-changes bit depth. Channel count changes only in the ``fmt `` header of a
-file this module writes.
+changes bit depth. Selected source channels are copied byte-for-byte into the output.
 
 RF64 and BW64 (EBU Tech 3306, ITU-R BS.2088) are used when a classic RIFF
 size field cannot hold the file. The ``ds64`` chunk then stores the real
@@ -152,7 +151,7 @@ class WavInfo:
 
 @dataclass(frozen=True)
 class SourceView:
-    """Identity and audio digest of one mono file, taken while it was read."""
+    """Identity and full raw audio digest of one source file, taken while it was read."""
 
     dev: int
     ino: int
@@ -495,6 +494,58 @@ def hash_region(handle, offset: int, nbytes: int) -> str:
     return digest.hexdigest()
 
 
+def extract_channel(blob: bytes, width: int, channels: int, channel: int) -> bytes:
+    """Copy one interleaved channel without decoding or changing sample bits."""
+    if channels not in (1, 2) or not 0 <= channel < channels:
+        raise WavError("invalid source channel selection")
+    if width <= 0 or len(blob) % (width * channels):
+        raise WavError("audio length is not a whole number of frames")
+    if channels == 1:
+        return blob
+    out = bytearray(len(blob) // channels)
+    for byte in range(width):
+        out[byte::width] = blob[channel * width + byte::width * channels]
+    return bytes(out)
+
+
+def scan_stereo_channel(handle, info: WavInfo, *, preferred: int, chunk_frames: int = 65536) -> tuple[int, bool, str]:
+    """Select the sole nonzero channel, hashing the exact bytes inspected.
+
+    Both signed floating zero encodings are silent. Every other bit pattern,
+    including subnormals, infinities and NaNs, counts as audio. Activity on
+    different frames still makes a two-active-channel source unsafe.
+    """
+    if chunk_frames < 1:
+        raise WavError("chunk_frames must be positive")
+    width = info.fmt.sample_width
+    if info.fmt.channels != 2 or info.fmt.block_align != 2 * width or info.data_remainder:
+        raise WavError("stereo scan requires complete two-channel frames")
+    handle.seek(info.data_offset)
+    digest = hashlib.sha256()
+    active = [False, False]
+    remaining = info.frames
+    while remaining:
+        count = min(remaining, chunk_frames, 65536)
+        blob = _read_frames(handle, count, width * 2, info.path)
+        digest.update(blob)
+        for channel in range(2):
+            if active[channel]:
+                continue
+            samples = extract_channel(blob, width, 2, channel)
+            if info.fmt.is_float:
+                # IEEE little-endian sign occupies bit 7 of the last byte.
+                active[channel] = any(samples[i::width].strip(b"\0") for i in range(width - 1)) or any(
+                    byte & 0x7f for byte in samples[width - 1::width]
+                )
+            else:
+                active[channel] = bool(samples.strip(b"\0"))
+        remaining -= count
+    if all(active):
+        raise WavError(f"{info.path}: both stereo channels contain non-silent samples; refusing to discard or mix audio")
+    silent = not any(active)
+    return (preferred if silent else int(active[1])), silent, digest.hexdigest()
+
+
 def read_audio(path: Path | str, info: WavInfo) -> bytes:
     path = Path(path)
     with path.open("rb") as handle:
@@ -579,8 +630,15 @@ def write_interleaved_wav(
     chunk_frames: int = 65536,
     left_handle=None,
     right_handle=None,
+    left_channels: int = 1,
+    right_channels: int = 1,
+    left_channel: int = 0,
+    right_channel: int = 0,
 ) -> WriteResult:
-    """Stream two mono files into one interleaved stereo data chunk."""
+    """Stream selected channels into stereo, retaining full-source digests."""
+    for channels, channel in ((left_channels, left_channel), (right_channels, right_channel)):
+        if channels not in (1, 2) or not 0 <= channel < channels:
+            raise WavError("invalid source channel selection")
     if chunk_frames < 1:
         raise WavError("chunk_frames must be positive")
     if sample_width <= 0:
@@ -616,6 +674,10 @@ def write_interleaved_wav(
             chunk_frames=chunk_frames,
             left_handle=left_handle,
             right_handle=right_handle,
+            left_channels=left_channels,
+            right_channels=right_channels,
+            left_channel=left_channel,
+            right_channel=right_channel,
         )
         if data_size & 1:
             handle.write(b"\x00")
@@ -692,6 +754,10 @@ def _stream_interleave(
     chunk_frames: int,
     left_handle=None,
     right_handle=None,
+    left_channels: int = 1,
+    right_channels: int = 1,
+    left_channel: int = 0,
+    right_channel: int = 0,
 ) -> tuple[str, SourceView, SourceView]:
     frames = max(left_frames, right_frames)
     produced = 0
@@ -715,10 +781,12 @@ def _stream_interleave(
             count = min(chunk_frames, frames - produced)
             take_left = min(count, left_left)
             take_right = min(count, right_left)
-            left_bytes = _read_frames(left_handle, take_left, width, left_path)
-            right_bytes = _read_frames(right_handle, take_right, width, right_path)
+            left_bytes = _read_frames(left_handle, take_left, width * left_channels, left_path)
+            right_bytes = _read_frames(right_handle, take_right, width * right_channels, right_path)
             left_hash.update(left_bytes)
             right_hash.update(right_bytes)
+            left_bytes = extract_channel(left_bytes, width, left_channels, left_channel)
+            right_bytes = extract_channel(right_bytes, width, right_channels, right_channel)
             if take_left < count:
                 left_bytes += bytes((count - take_left) * width)
             if take_right < count:
@@ -736,8 +804,8 @@ def _stream_interleave(
             right_handle.close()
     return (
         audio_hash.hexdigest(),
-        _source_view(left_stat, left_offset, left_frames * width, left_hash.hexdigest()),
-        _source_view(right_stat, right_offset, right_frames * width, right_hash.hexdigest()),
+        _source_view(left_stat, left_offset, left_frames * width * left_channels, left_hash.hexdigest()),
+        _source_view(right_stat, right_offset, right_frames * width * right_channels, right_hash.hexdigest()),
     )
 
 

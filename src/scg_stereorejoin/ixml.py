@@ -45,8 +45,16 @@ class _CommentBuilder(ET.TreeBuilder):
         self.end(ET.Comment)
 
 
-def update_ixml(left_blob: bytes, right_blob: bytes | None = None) -> IxmlUpdate:
-    """Return new iXML bytes. Invalid XML is copied through with a warning."""
+def update_ixml(left_blob: bytes, right_blob: bytes | None = None, *,
+                left_channel: int | None = None, right_channel: int | None = None,
+                base_from_right: bool = False) -> IxmlUpdate:
+    """Return new iXML bytes. Invalid XML is copied through with a warning.
+
+    Optional zero-based channel indexes select physical stereo source tracks
+    instead of the legacy mono FUNCTION preference. ``base_from_right`` is
+    used when only the right stereo source has iXML: retain its document but
+    do not mislabel its silent channel as metadata for the absent left track.
+    """
     warnings: list[str] = []
     try:
         left_text = _decode(left_blob)
@@ -71,7 +79,7 @@ def update_ixml(left_blob: bytes, right_blob: bytes | None = None) -> IxmlUpdate
     changed = False
     track_list = _find(root, "TRACK_LIST")
     if track_list is not None:
-        _rewrite_tracks(track_list, right_root, warnings)
+        _rewrite_tracks(track_list, right_root, warnings, left_channel, right_channel, base_from_right)
         changed = True
     file_set = _find(root, "FILE_SET")
     if file_set is not None and _collapse_pair_file_set(file_set):
@@ -90,27 +98,34 @@ def mirror_channel_name(name: str) -> str:
     return name
 
 
-def _rewrite_tracks(track_list: ET.Element, right_root: ET.Element | None, warnings: list[str]) -> None:
+def _rewrite_tracks(track_list: ET.Element, right_root: ET.Element | None, warnings: list[str],
+                    left_channel: int | None = None, right_channel: int | None = None,
+                    base_from_right: bool = False) -> None:
     existing = _children(track_list, "TRACK")
     for track in existing:
         track_list.remove(track)
-    left_track = _prefer(existing, "LEFT")
+    left_track = _selected_track(existing, left_channel, "LEFT", warnings)
+    if base_from_right:
+        left_track = _new_element(track_list, "TRACK")
+        _set_child(left_track, "NAME", "Left")
     if left_track is None:
         left_track = existing[0] if existing else _new_element(track_list, "TRACK")
         if not existing:
             warnings.append("iXML track list had no TRACK entry; added Left and Right")
 
     right_track: ET.Element | None = None
+    if base_from_right:
+        right_track = _selected_track(existing, right_channel, "RIGHT", warnings)
     if right_root is not None:
         right_list = _find(right_root, "TRACK_LIST")
         if right_list is not None:
             right_tracks = _children(right_list, "TRACK")
-            chosen = _prefer(right_tracks, "RIGHT")
+            chosen = _selected_track(right_tracks, right_channel, "RIGHT", warnings)
             if chosen is None and right_tracks:
                 chosen = right_tracks[0]
             if chosen is not None:
                 right_track = copy.deepcopy(chosen)
-    if right_track is None and len(existing) >= 2:
+    if right_track is None and len(existing) >= 2 and left_channel is None and not base_from_right:
         spare = next((track for track in existing if track is not left_track), None)
         if spare is not None:
             right_track = spare
@@ -132,6 +147,29 @@ def _rewrite_tracks(track_list: ET.Element, right_root: ET.Element | None, warni
         track_list.insert(0, _new_element(track_list, "TRACK_COUNT", "2"))
     track_list.append(left_track)
     track_list.append(right_track)
+
+
+def _selected_track(tracks: list[ET.Element], channel: int | None, function: str,
+                    warnings: list[str]) -> ET.Element | None:
+    if channel is None:
+        return _prefer(tracks, function)
+    # INTERLEAVE_INDEX identifies the physical sample channel; CHANNEL_INDEX
+    # can instead identify an original recorder track in a split file.
+    for field in ("INTERLEAVE_INDEX", "CHANNEL_INDEX"):
+        indexed = [track for track in tracks if _children(track, field)]
+        if indexed:
+            matches = [track for track in indexed if
+                       (_children(track, field)[0].text or "").strip() == str(channel + 1)]
+            if len(matches) == 1:
+                return matches[0]
+            break
+    else:
+        if len(tracks) == 2:
+            return tracks[channel]
+    warnings.append(f"iXML metadata for selected internal channel {channel + 1} is unavailable; used a generic {function.title()} track")
+    track = ET.Element("TRACK") if not tracks else _new_element(tracks[0], "TRACK")
+    _set_child(track, "NAME", function.title())
+    return track
 
 
 def _retitle_clone(track: ET.Element) -> None:

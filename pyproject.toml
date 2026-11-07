@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scg-stereorejoin"
-version = "1.0.0"
-description = "Re-join Pro Tools, Cubase, and Nuendo split dual-mono WAVs into bit-exact interleaved stereo."
+version = "1.0.2"
+description = "Re-join paired mono or single-sided stereo WAVs into bit-exact interleaved stereo."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

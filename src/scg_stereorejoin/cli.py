@@ -29,7 +29,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="scg-stereorejoin",
         description=(
-            "Re-join split dual-mono WAV files from Pro Tools, Cubase, and Nuendo "
+            "Re-join paired L/R WAV files (mono, or stereo with one silent channel) "
             "into one bit-exact interleaved stereo WAV."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -79,7 +79,7 @@ def build_parser():
         "--delete-sources",
         action="store_true",
         help=(
-            "move the two mono files into .scg_stereorejoin_trash after the stereo file "
+            "move the two source files into .scg_stereorejoin_trash after the stereo file "
             "verifies, and only if they are still the version that was read"
         ),
     )

@@ -4,6 +4,8 @@
 
 SCG_StereoRejoin joins a split dual-mono export back into one interleaved stereo WAV. It is aimed at files from **Pro Tools**, **Cubase**, and **Nuendo**: a left file and a right file, often with BWF (`bext`) and iXML metadata, that should be one stereo clip again.
 
+Version 1.0.1 also accepts a two-channel WAV when at least one internal channel is digitally silent throughout the entire file. Mono and these single-sided stereo files may be paired together.
+
 The samples are copied **byte for byte**. The tool does not resample, dither, or change bit depth. When the result is larger than 4 GB it is written as **RF64** (or **BW64** if you ask). The BWF timestamp is preserved, so the stereo file can re-spot to the original timeline position.
 
 ```
@@ -63,6 +65,8 @@ python -m pip install tkinterdnd2
 
 The window still works with Add files / Add folder when that package is absent.
 
+Version 1.0.2 adds a language selector for English, 简体中文 and 日本語. Labels, help, app messages and reports change without clearing your files, options or pairing rules. Hover over the six processing options or pairing rules to read an explanation; move away to dismiss it. Native file-picker controls follow the operating system language.
+
 ## Quick start
 
 The repository includes a small set of split files in `examples/` (24-bit, 16-bit, 32-bit float, several naming styles, one nested folder, and one file with no partner).
@@ -104,7 +108,7 @@ scg-stereorejoin [options] PATH...
 | `--no-default-patterns` | Use only the patterns you passed. |
 | `--pad` | Lengths differ: extend the shorter side with zero bytes (silence for integer PCM and for float) and warn. |
 | `--overwrite` | Replace an output file that is already there. This never replaces an input WAV from the same batch. |
-| `--delete-sources` | Move each mono file into `.scg_stereorejoin_trash/` after the output verifies, and only if that source is still the version that was read. The trash copy is kept. |
+| `--delete-sources` | Move each source file into `.scg_stereorejoin_trash/` after the output verifies, and only if that source is still the version that was read. The trash copy is kept. |
 | `--bw64` | Use a BW64 container instead of RF64 when the output is larger than 4 GB. |
 | `-n`, `--dry-run` | Print the plan, including refusals, and write nothing. |
 | `--json` | Print a JSON report. The exit code is unchanged. |
@@ -118,7 +122,7 @@ Exit code **0** means every pair that could be checked was joined. Unpaired and 
 A pair is refused, and no stereo file is written, when:
 
 - the sample rate, bit depth, valid bits, or integer/float format differs
-- either file is not mono
+- either file has more than two channels, or a two-channel source has nonzero samples in both channels
 - the lengths differ and `--pad` was not set
 - the output path already exists and `--overwrite` was not set
 - two pairs would write the same path
@@ -162,7 +166,15 @@ Supported sample formats, including `WAVE_FORMAT_EXTENSIBLE`:
 - 16-bit, 24-bit, and 32-bit integer PCM
 - 32-bit and 64-bit IEEE float
 
-Both files have to agree on sample rate, container width, valid bits, and integer versus float. A 32-bit integer file and a 32-bit float file are different formats. Extensible mono files may use different channel masks (front left, front right); the stereo file gets the standard front-left | front-right mask (`0x3`). The sample bytes are still copied, not converted.
+### Single-sided stereo sources (1.0.1)
+
+`Take_L.wav` can contain audio in either internal channel and digital silence in the other; `Take_R.wav` can do the same. The file paired as Left always supplies the output left channel, and the file paired as Right always supplies the output right channel. The detected internal channel is reported in the log. There is no summing, normalization, threshold gate, or conversion.
+
+Every sample is checked in bounded chunks, including long silent introductions and late audio. Signed PCM zero and floating-point +0/-0 count as silence. Very quiet or subnormal samples, NaN, and infinity are not silence. If both internal channels contain any nonzero sample anywhere in a file, it is refused, even if they never play simultaneously or are identical. Both channels completely silent is safe: a silent channel is retained. PCM 8-bit and more-than-two-channel sources remain unsupported.
+
+Dry run performs the same full channel scan without writing outputs. The original full stereo payload is included in the source digest, including the discarded silent channel. Existing no-overwrite, source-change, atomic output, and verified-retirement protections still apply. Source retirement uses the hidden `.scg_stereorejoin_trash` folder beside each source, not the system Trash.
+
+Both files have to agree on sample rate, container width, valid bits, and integer versus float. A 32-bit integer file and a 32-bit float file are different formats. Extensible source files may use different channel masks (front left, front right); the stereo file gets the standard front-left | front-right mask (`0x3`). The sample bytes are still copied, not converted.
 
 `--pad` zero-fills the shorter side. The samples that were already there stay bit-exact. The log says how many silent frames were added, and to which side.
 
@@ -227,7 +239,7 @@ python -m pip install -e ".[dev]"
 pytest
 ```
 
-The suite builds synthetic mono WAVs (it does not need a DAW) and checks:
+The suite builds synthetic mono and single-sided stereo WAVs (it does not need a DAW) and checks:
 
 - bit-exact interleave for 16/24/32-bit PCM and 32/64-bit float, including a chunk size that does not divide the file
 - `bext` bytes, cue, LIST/INFO, and the iXML track list / file set
